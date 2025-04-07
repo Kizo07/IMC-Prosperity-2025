@@ -64,4 +64,4 @@ argmax, _ = maximize(4)
 print("Optimal sequences of trades:")
 for seq in argmax:
     res = ' -> '.join([products[0]] + [products[i] for i in seq] + [products[0]])
-    print(res)a
+    print(res)
