@@ -2,11 +2,9 @@ from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder
 
 import json
 import jsonpickle
-import numpy as np  # Add numpy import
+import numpy as np
 from typing import Any, List
-from collections import deque  # Add deque for efficient sliding window operations
-
-
+from collections import deque  # For efficient sliding window operations
 
 """
 GRID SEARCH param. Leave this equal to None to initialize it.
@@ -153,35 +151,37 @@ class Product:
 PARAMS = {
     Product.RAINFOREST_RESIN: {
         "fair_value": 10000,
-        "clear_width": 0
+        "clear_width": 0,
+        "signal_threshold": 0.05  # Lower threshold for RESIN since strategy differences are smaller
     },
     Product.KELP: {
         "fair_value": 2000,
         "ewma_beta": 0, # found using grid search 0 - 1
         "clear_width": 0,
-        "rolling_window": 100,  # Reduced window size for efficiency
-        "spread_multiplier": 1.1,  # Multiplier for the typical spread (slightly smaller than SQUID_INK)
-        "min_spread": 2,           # Minimum spread to use
-        "max_spread": 5,           # Maximum spread to use (slightly smaller than SQUID_INK)
-        "position_scale": 0.55,     # How much to scale orders based on position
-        "vol_window": 15,          # Window for calculating spread
-        "order_skew_threshold": 0.25 # Threshold for skewing orders based on book imbalance
+        "rolling_window": 30,
+        "spread_multiplier": 1.1,
+        "min_spread": 2,
+        "max_spread": 5,
+        "position_scale": 0.6,
+        "vol_window": 10,
+        "order_skew_threshold": 0.25,
+        "signal_threshold": 0.15  # Medium threshold for KELP
     },
     Product.SQUID_INK: {
         "fair_value": 2000,
-        "ewma_beta": 0.25, # found using grid search 0 - 1
+        "ewma_beta": 0.15, # found using grid search 0 - 1
         "clear_width": 0,
-        "rolling_window": 100,  # Reduced window size for efficiency
-        "spread_multiplier": 1.2,  # Multiplier for the typical spread
-        "min_spread": 2,           # Minimum spread to use
-        "max_spread": 6,           # Maximum spread to use
-        "position_scale": 0.7,     # How much to scale orders based on position
-        "vol_window": 20,          # Window for calculating spread
-        "order_skew_threshold": 0.3 # Threshold for skewing orders based on book imbalance
+        "rolling_window": 100,
+        "spread_multiplier": 1.3,
+        "min_spread": 2,
+        "max_spread": 7,
+        "position_scale": 0.75,
+        "vol_window": 35,
+        "order_skew_threshold": 0.4,
+        "signal_threshold": 0.1  # Higher threshold for SQUID_INK
     }
 }
 
-    
     
 class Trader:
     
@@ -275,10 +275,9 @@ class Trader:
     ) -> float:
         
         """
-        Helper function used to find the order flow imbalance from current data
-        and previous data (not well tested)
+        Helper function used to find the order flow imbalance
         """
-        if not traderObject["prev_quote"][product]:
+        if not traderObject.get("prev_quote", {}).get(product):
             return 0
             
         B_n, A_n, q_B_n, q_A_n = self.best_orders(product, order_depth)
@@ -303,54 +302,28 @@ class Trader:
                + I_A_increase * q_A_n_minus_1)
 
         return e_n
-
-      
-    def previous_midprice(
-            self,
-            product:str,
-            traderObject: dict
-            ) -> float:
-        """
-        Helper function used to calculate the previous tick's mid price
-        """  
-        
-        try:
-            prev_bid = traderObject["prev_quote"][product][0]
-            prev_ask = traderObject["prev_quote"][product][1]
-            if prev_bid is not None and prev_ask is not None:
-                return (prev_bid + prev_ask) / 2
-            return None
-        
-        except (IndexError, TypeError):
-            return None
     
-    
-    def full_book_weighted_mid_price(
-            self,
-            product:str,
-            order_depth: OrderDepth
-            ) -> float:
-   
+    def calculate_book_imbalance(self, order_depth):
         """
-        Computes the full book volume-weighted mid-price using *all* buy and sell orders.
-        Optimized with numpy arrays
+        Calculate order book imbalance to determine market direction pressure
         """
         if not order_depth.buy_orders and not order_depth.sell_orders:
-            return None
+            return 0
             
         # Convert to numpy arrays for faster computation
-        buy_prices = np.array(list(order_depth.buy_orders.keys()))
         buy_volumes = np.array(list(order_depth.buy_orders.values()))
-        sell_prices = np.array(list(order_depth.sell_orders.keys()))
-        sell_volumes = np.abs(np.array(list(order_depth.sell_orders.values())))
+        sell_volumes = np.array(list(order_depth.sell_orders.values()))
         
-        weighted_sum = np.sum(buy_prices * buy_volumes) + np.sum(sell_prices * sell_volumes)
-        total_volume = np.sum(buy_volumes) + np.sum(sell_volumes)
-    
+        buy_volume = np.sum(buy_volumes)
+        sell_volume = np.abs(np.sum(sell_volumes))
+        
+        total_volume = buy_volume + sell_volume
+        
         if total_volume == 0:
-            return None
-    
-        return weighted_sum / total_volume
+            return 0
+            
+        imbalance = (buy_volume - sell_volume) / total_volume
+        return imbalance  # Range: [-1, 1]
     
     def ewma(
         self,
@@ -382,12 +355,11 @@ class Trader:
         product: str,
         traderObject: dict,
         mid: float,
-        beta: float  # smoothing factor, e.g., 0.94
+        beta: float  # smoothing factor
         ) -> float:
         
         """
-        Calculates exponentially weighted volatility (standard deviation) of price levels.
-        Optimized with numpy arrays for faster computation.
+        Calculates exponentially weighted volatility of price levels.
         """
         
         # Access or initialize tracking variables
@@ -416,22 +388,49 @@ class Trader:
         
         # Return standard deviation
         return np.sqrt(vol_data["ewma_var"])
-
-    def ink_fair_value(
+        
+    def evaluate_signal_strength(
             self,
-            product:str,
-            traderObject: dict,
-            kelp_lag: int
+            product: str,
+            order_depth: OrderDepth,
+            traderObject: dict
             ) -> float:
+        """
+        Evaluates the strength of market signals to determine which strategy to use.
+        Returns a normalized value between 0 and 1 where higher values indicate stronger signals.
+        """
+        # Calculate book imbalance as one signal component
+        imbalance = self.calculate_book_imbalance(order_depth)
+        imbalance_strength = abs(imbalance)
         
-        kelp_prices = traderObject.get("rolling_mid_quotes", {}).get(Product.KELP)
+        # Calculate order flow imbalance as another signal component
+        flow_imbalance = self.order_flow_imbalance(product, order_depth, traderObject)
         
-        if not kelp_prices or len(kelp_prices) <= kelp_lag:
-            return None
+        # Normalize flow_imbalance (typically in range of volume)
+        max_flow = 50  # typical max position
+        flow_strength = min(1.0, abs(flow_imbalance) / max_flow)
         
-        # Convert to numpy array for efficient calculation
-        prices_array = np.array(kelp_prices)
-        return np.mean(prices_array)
+        # Calculate price volatility as another signal component
+        volatility = 0
+        if "vol" in traderObject and product in traderObject["vol"]:
+            vol_data = traderObject["vol"][product]
+            if "ewma_var" in vol_data:
+                volatility = vol_data["ewma_var"] ** 0.5  # Get standard deviation
+                
+        # Normalize volatility (typically in range of 1-10 price units)
+        vol_strength = min(1.0, volatility / 10.0)
+        
+        # Combine signals with weights
+        # Imbalance gets highest weight as it's most reliable for short-term direction
+        # Volatility gets medium weight as it indicates potential trading opportunities
+        # Flow gets lowest weight as it can be noisy
+        signal_strength = (0.55 * imbalance_strength) + (0.35 * vol_strength) + (0.1 * flow_strength)
+        
+        return signal_strength
+
+    #########################################
+    ### V5 Strategy Methods (Simple) #######
+    #########################################
         
     def take_orders(
             self,
@@ -443,7 +442,7 @@ class Trader:
             ) -> (List[Order], int, int):
         
         """
-        Primary function used to place directional orders based on market prices and a pre-determined fair value
+        Primary function used to place directional orders based on market prices and a pre-determined fair value. Typically always the MM-mid
         """  
         
         orders: List[Order] = []
@@ -464,24 +463,23 @@ class Trader:
                 orders.append(Order(product, best_ask, buy_volume))
                 buy_quantity = buy_volume
                     
-        return orders, buy_quantity, sell_quantity #signed, passed onto make so they don't cancel each other
+        return orders, buy_quantity, sell_quantity
     
-    
-    def resin_make_orders(
+    def resin_make_orders_v5(
         self,
         product: str,
-        order_depth: OrderDepth,  # Product-specific OrderDepth
+        order_depth: OrderDepth,
         fair_value: int,
         position: int,
         position_limit: int,
-        default_edge: float,  # The distance from fair value for bids/asks
+        default_edge: float,
         default_order_size: int,
-        take_buy_quantity: int, # existing buy and sell orders we have placed due to market taking to prevent cancellation
+        take_buy_quantity: int,
         take_sell_quantity: int
         ) -> (List[Order], int, int):
 
         """
-        Primary function used to market make for RAINFOREST RESIN
+        Market making for RAINFOREST RESIN from v5
         """  
         if fair_value is None:
             return [], 0, 0
@@ -496,8 +494,8 @@ class Trader:
         sell_quantity = 0
     
         # Check position limits
-        max_buy_capacity = position_limit - position - take_buy_quantity # Maximum we can buy
-        max_sell_capacity = position + position_limit - take_sell_quantity # Maximum we can sell
+        max_buy_capacity = position_limit - position - take_buy_quantity
+        max_sell_capacity = position + position_limit - take_sell_quantity
     
         # Place bid order if does not exceed capacity
         if max_buy_capacity > 0:
@@ -511,8 +509,7 @@ class Trader:
     
         return orders, buy_quantity, sell_quantity
     
-    
-    def clear_orders(
+    def clear_orders_v5(
             self,
             product: str,
             order_depth: OrderDepth,
@@ -520,7 +517,7 @@ class Trader:
             position: int,
             position_limit: int,
             clear_width: int,
-            take_buy_quantity: int, # existing buy and sell orders we have placed due to market taking to prevent cancellation
+            take_buy_quantity: int,
             take_sell_quantity: int
             ) -> (List[Order], int, int):
         
@@ -565,78 +562,112 @@ class Trader:
     
         return orders, take_buy_quantity, take_sell_quantity
     
-    
-    def make_orders(self,
-        product: str,
-        order_depth: OrderDepth,  # Product-specific OrderDepth
-        fair_value: int,
-        position: int,
-        position_limit: int,
-        default_edge: float,  # The distance from fair value for bids/asks
-        default_order_size: float,
-        disregard_edge: float,
-        join_edge: float,
-        take_buy_quantity: int, # existing buy and sell orders we have placed due to market taking to prevent cancellation
-        take_sell_quantity: int
-        ) -> (List[Order], int, int):
-        
-        if fair_value is None:
-            return [], 0, 0
-            
+    def kelp_make_orders_v5(
+            self,
+            product: str,
+            order_depth: OrderDepth,
+            fair_value: int,
+            position: int,
+            position_limit: int,
+            default_order_size: int,
+            take_buy_quantity: int,
+            take_sell_quantity: int,
+            bias: float,
+            state: TradingState
+            ) -> (List[Order], int, int):
+
         orders: List[Order] = []
-        
-        asks_above_fair = [
-            price
-            for price in order_depth.sell_orders.keys()
-            if price > fair_value + disregard_edge
-        ]
-        bids_below_fair = [
-            price
-            for price in order_depth.buy_orders.keys()
-            if price < fair_value - disregard_edge
-        ]
-        
-        best_ask_above_fair = min(asks_above_fair) if asks_above_fair else None
-        best_bid_below_fair = max(bids_below_fair) if bids_below_fair else None
-
-        ask_price = round(fair_value + default_edge)
-        if best_ask_above_fair is not None:
-            if abs(best_ask_above_fair - fair_value) <= join_edge:
-                ask_price = best_ask_above_fair  # join
-            else:
-                ask_price = best_ask_above_fair - 1  # penny
-
-        bid_price = round(fair_value - default_edge)
-        if best_bid_below_fair is not None:
-            if abs(fair_value - best_bid_below_fair) <= join_edge:
-                bid_price = best_bid_below_fair
-            else:
-                bid_price = best_bid_below_fair + 1
-                
+    
+        EDGE = 1.5
+        BIAS = bias
+    
+        # Start with base bid/ask
+        bid_price = fair_value - EDGE
+        ask_price = fair_value + EDGE
+    
+        # Bias based on inventory
+        if position < 0:
+            # Want to buy more → more aggressive bid
+            bid_price += BIAS
+        elif position > 0:
+            # Want to sell more → more aggressive ask
+            ask_price -= BIAS
+    
+        # Round to int
+        bid_price = round(bid_price)
+        ask_price = round(ask_price)
+    
+        # Inventory-aware capacity
+        max_buy_capacity = position_limit - position - take_buy_quantity
+        max_sell_capacity = position_limit + position - take_sell_quantity
+    
         buy_quantity = 0
         sell_quantity = 0
     
-        # Check position limits
-        max_buy_capacity = position_limit - position - take_buy_quantity # Maximum we can buy
-        max_sell_capacity = position_limit + position  - take_sell_quantity # Maximum we can sell
-    
-        # Place bid order if does not exceed capacity
+        # Place buy order
         if max_buy_capacity > 0:
             buy_quantity = min(default_order_size, max_buy_capacity)
             orders.append(Order(product, bid_price, buy_quantity))
     
-        # Place ask order if does not exceed capacity
+        # Place sell order
         if max_sell_capacity > 0:
             sell_quantity = min(default_order_size, max_sell_capacity)
             orders.append(Order(product, ask_price, -sell_quantity))
     
         return orders, buy_quantity, sell_quantity
     
+    def ink_make_orders_v5(self,
+                        product: str,
+                        order_depth: OrderDepth,
+                        fair_value: int,
+                        position: int,
+                        position_limit: int,
+                        default_order_size: int,
+                        take_buy_quantity: int,
+                        take_sell_quantity: int,
+                        penny_amount: int = 1
+                        ) -> (List[Order], int, int):
+        
+        orders: List[Order] = []
+        buy_quantity = 0
+        sell_quantity = 0
+        
+        mm_bid, mm_ask, mm_bid_quantity, mm_ask_quantity = self.mm_orders(product, order_depth)
+        
+        if mm_bid is None or mm_ask is None:
+            return orders, buy_quantity, sell_quantity
+            
+        bid_price = mm_bid + penny_amount
+        ask_price = mm_ask - penny_amount
+        
+        max_buy_capacity = position_limit - position - take_buy_quantity
+        max_sell_capacity = position_limit + position - take_sell_quantity
+        
+        # Place buy order
+        if max_buy_capacity > 0 and position < 0:
+            buy_quantity = min(default_order_size, max_buy_capacity)
+            orders.append(Order(product, bid_price, buy_quantity))
+    
+        # Place sell order
+        if max_sell_capacity > 0 and position > 0:
+            sell_quantity = min(default_order_size, max_sell_capacity)
+            orders.append(Order(product, ask_price, -sell_quantity))
+            
+        if max_sell_capacity > 0 and max_buy_capacity > 0 and position == 0:
+            buy_quantity = min(default_order_size, max_buy_capacity)
+            orders.append(Order(product, bid_price, buy_quantity))
+            sell_quantity = min(default_order_size, max_sell_capacity)
+            orders.append(Order(product, ask_price, -sell_quantity))
+    
+        return orders, buy_quantity, sell_quantity
+
+    #########################################
+    ### V15 Strategy Methods (Advanced) ####
+    #########################################
     
     def calculate_optimal_spread(self, product, traderObject, current_spread):
         """
         Calculate the optimal spread based on recent price volatility
-        Using numpy for faster calculations
         """
         if "price_history" not in traderObject:
             traderObject["price_history"] = {}
@@ -675,32 +706,103 @@ class Trader:
         
         return optimal_spread
     
-    
-    def calculate_book_imbalance(self, order_depth):
+    def kelp_market_making_v15(self,
+        product: str,
+        order_depth: OrderDepth,
+        fair_value: float,
+        position: int,
+        position_limit: int,
+        traderObject: dict,
+        take_buy_quantity: int,
+        take_sell_quantity: int
+        ) -> (List[Order], int, int):
         """
-        Calculate order book imbalance to determine market direction pressure
-        Using numpy for faster calculations
+        Advanced market making strategy for KELP based on order book distributions
+        and spread-capturing opportunities
         """
-        if not order_depth.buy_orders and not order_depth.sell_orders:
-            return 0
+        if fair_value is None:
+            return [], 0, 0
             
-        # Convert to numpy arrays for faster computation
-        buy_volumes = np.array(list(order_depth.buy_orders.values()))
-        sell_volumes = np.array(list(order_depth.sell_orders.values()))
+        orders = []
         
-        buy_volume = np.sum(buy_volumes)
-        sell_volume = np.abs(np.sum(sell_volumes))
-        
-        total_volume = buy_volume + sell_volume
-        
-        if total_volume == 0:
-            return 0
+        # Store current price in history
+        if "price_history" not in traderObject:
+            traderObject["price_history"] = {}
+        if product not in traderObject["price_history"]:
+            traderObject["price_history"][product] = deque(maxlen=100)
             
-        imbalance = (buy_volume - sell_volume) / total_volume
-        return imbalance  # Range: [-1, 1]
+        traderObject["price_history"][product].append(fair_value)
+            
+        # Get best bid and ask
+        best_bid, best_ask, _, _ = self.best_orders(product, order_depth)
+        
+        # Current market spread
+        current_spread = best_ask - best_bid if best_bid is not None and best_ask is not None else 2
+        
+        # Calculate optimal spread based on volatility
+        optimal_spread = self.calculate_optimal_spread(product, traderObject, current_spread)
+        
+        # Calculate book imbalance to detect pressure
+        imbalance = self.calculate_book_imbalance(order_depth)
+        
+        # Adjust fair value slightly based on imbalance if significant
+        adjusted_fair_value = fair_value
+        if abs(imbalance) > self.params[product]["order_skew_threshold"]:
+            adjusted_fair_value += imbalance * optimal_spread / 3
+            
+        # Calculate position scaling factor (reduce size as position grows)
+        position_ratio = position / position_limit if position_limit != 0 else 0
+        position_scale = 1.0 - abs(position_ratio) * self.params[product]["position_scale"]
+        
+        # Default order size, scaled by position
+        default_order_size = 18
+        adjusted_order_size = max(1, int(default_order_size * position_scale))
+        
+        # Skew order sizes based on current position
+        buy_size = adjusted_order_size
+        sell_size = adjusted_order_size
+        
+        if position > 0:
+            # If we're long, increase sell size and decrease buy size
+            sell_size = int(adjusted_order_size * (1 + position_ratio * 0.6))
+            buy_size = int(adjusted_order_size * (1 - position_ratio * 0.6))
+        elif position < 0:
+            # If we're short, increase buy size and decrease sell size
+            sell_size = int(adjusted_order_size * (1 + position_ratio * 0.6))
+            buy_size = int(adjusted_order_size * (1 - position_ratio * 0.6))
+            
+        # Calculate bid and ask prices
+        half_spread = optimal_spread / 2
+        
+        # For KELP, we'll be slightly more conservative in our skewing
+        if imbalance > self.params[product]["order_skew_threshold"]:
+            bid_price = int(adjusted_fair_value - half_spread * 0.85)  # Tighter bid
+            ask_price = int(adjusted_fair_value + half_spread * 1.15)  # Wider ask
+        elif imbalance < -self.params[product]["order_skew_threshold"]:
+            bid_price = int(adjusted_fair_value - half_spread * 1.15)  # Wider bid
+            ask_price = int(adjusted_fair_value + half_spread * 0.85)  # Tighter ask
+        else:
+            bid_price = int(adjusted_fair_value - half_spread)
+            ask_price = int(adjusted_fair_value + half_spread)
+            
+        # Check position limits
+        max_buy_capacity = position_limit - position - take_buy_quantity
+        max_sell_capacity = position_limit + position - take_sell_quantity
+        
+        # Adjust order sizes based on remaining capacity
+        buy_size = min(buy_size, max_buy_capacity)
+        sell_size = min(sell_size, max_sell_capacity)
+        
+        # Place orders if there's capacity
+        if buy_size > 0:
+            orders.append(Order(product, bid_price, buy_size))
+            
+        if sell_size > 0:
+            orders.append(Order(product, ask_price, -sell_size))
+            
+        return orders, buy_size, sell_size
     
-    
-    def squid_ink_market_making(self,
+    def squid_ink_market_making_v15(self,
         product: str,
         order_depth: OrderDepth,
         fair_value: float,
@@ -796,199 +898,7 @@ class Trader:
             orders.append(Order(product, ask_price, -sell_size))
             
         return orders, buy_size, sell_size
-    
-    def kelp_make_orders(
-            self,
-            product: str,
-            order_depth: OrderDepth,
-            fair_value: int,
-            position: int,
-            position_limit: int,
-            default_order_size: int,
-            take_buy_quantity: int,
-            take_sell_quantity: int,
-            bias: float,
-            state: TradingState
-            ) -> (List[Order], int, int):
 
-        orders: List[Order] = []
-    
-        EDGE = 1.5
-        BIAS = bias
-    
-        # Start with base bid/ask
-        bid_price = fair_value - EDGE
-        ask_price = fair_value + EDGE
-    
-        # Bias based on inventory
-        if position < 0:
-            # Want to buy more → more aggressive bid
-            bid_price += BIAS
-        elif position > 0:
-            # Want to sell more → more aggressive ask
-            ask_price -= BIAS
-    
-        # Round to int
-        bid_price = round(bid_price)
-        ask_price = round(ask_price)
-    
-        # Inventory-aware capacity
-        max_buy_capacity = position_limit - position - take_buy_quantity
-        max_sell_capacity = position + position_limit - take_sell_quantity
-    
-        buy_quantity = 0
-        sell_quantity = 0
-    
-        # Place buy order
-        if max_buy_capacity > 0:
-            buy_quantity = min(default_order_size, max_buy_capacity)
-            orders.append(Order(product, bid_price, buy_quantity))
-    
-        # Place sell order
-        if max_sell_capacity > 0:
-            sell_quantity = min(default_order_size, max_sell_capacity)
-            orders.append(Order(product, ask_price, -sell_quantity))
-    
-        return orders, buy_quantity, sell_quantity
-    
-    def ink_make_orders(self,
-                        product: str,
-                        order_depth: OrderDepth,
-                        fair_value: int,
-                        position: int,
-                        position_limit: int,
-                        default_order_size: int,
-                        take_buy_quantity: int,
-                        take_sell_quantity: int,
-                        penny_amount: int = 1
-                        ) -> (List[Order], int, int):
-        
-        orders: List[Order] = []
-        buy_quantity = 0
-        sell_quantity = 0
-        
-        
-        mm_bid, mm_ask, mm_bid_quantity, mm_ask_quantity = self.mm_orders(product, order_depth)
-        
-        bid_price = mm_bid + penny_amount
-        ask_price = mm_ask - penny_amount
-        
-        max_buy_capacity = position_limit - position - take_buy_quantity
-        max_sell_capacity = position + position_limit - take_sell_quantity
-        
-        # Place buy order
-        if max_buy_capacity > 0 and position < 0:
-            buy_quantity = min(default_order_size, max_buy_capacity)
-            orders.append(Order(product, bid_price, buy_quantity))
-    
-        # Place sell order
-        if max_sell_capacity > 0 and position > 0:
-            sell_quantity = min(default_order_size, max_sell_capacity)
-            orders.append(Order(product, ask_price, -sell_quantity))
-            
-        if max_sell_capacity > 0 and max_buy_capacity > 0 and position == 0:
-            buy_quantity = min(default_order_size, max_buy_capacity)
-            orders.append(Order(product, bid_price, buy_quantity))
-            sell_quantity = min(default_order_size, max_sell_capacity)
-            orders.append(Order(product, ask_price, -sell_quantity))
-    
-        return orders, buy_quantity, sell_quantity
-
-    def kelp_market_making(self,
-        product: str,
-        order_depth: OrderDepth,
-        fair_value: float,
-        position: int,
-        position_limit: int,
-        traderObject: dict,
-        take_buy_quantity: int,
-        take_sell_quantity: int
-        ) -> (List[Order], int, int):
-        """
-        Advanced market making strategy for KELP based on order book distributions
-        and spread-capturing opportunities
-        """
-        if fair_value is None:
-            return [], 0, 0
-            
-        orders = []
-        
-        # Store current price in history
-        if "price_history" not in traderObject:
-            traderObject["price_history"] = {}
-        if product not in traderObject["price_history"]:
-            traderObject["price_history"][product] = deque(maxlen=100)
-            
-        traderObject["price_history"][product].append(fair_value)
-            
-        # Get best bid and ask
-        best_bid, best_ask, _, _ = self.best_orders(product, order_depth)
-        
-        # Current market spread
-        current_spread = best_ask - best_bid if best_bid is not None and best_ask is not None else 2
-        
-        # Calculate optimal spread based on volatility
-        optimal_spread = self.calculate_optimal_spread(product, traderObject, current_spread)
-        
-        # Calculate book imbalance to detect pressure
-        imbalance = self.calculate_book_imbalance(order_depth)
-        
-        # Adjust fair value slightly based on imbalance if significant
-        adjusted_fair_value = fair_value
-        if abs(imbalance) > self.params[product]["order_skew_threshold"]:
-            adjusted_fair_value += imbalance * optimal_spread / 3  # Less aggressive than SQUID_INK
-            
-        # Calculate position scaling factor (reduce size as position grows)
-        position_ratio = position / position_limit if position_limit != 0 else 0
-        position_scale = 1.0 - abs(position_ratio) * self.params[product]["position_scale"]
-        
-        # Default order size, scaled by position
-        default_order_size = 18  # Slightly larger than SQUID_INK
-        adjusted_order_size = max(1, int(default_order_size * position_scale))
-        
-        # Skew order sizes based on current position
-        buy_size = adjusted_order_size
-        sell_size = adjusted_order_size
-        
-        if position > 0:
-            # If we're long, increase sell size and decrease buy size
-            sell_size = int(adjusted_order_size * (1 + position_ratio * 0.6))
-            buy_size = int(adjusted_order_size * (1 - position_ratio * 0.6))
-        elif position < 0:
-            # If we're short, increase buy size and decrease sell size
-            sell_size = int(adjusted_order_size * (1 + position_ratio * 0.6))
-            buy_size = int(adjusted_order_size * (1 - position_ratio * 0.6))
-            
-        # Calculate bid and ask prices
-        half_spread = optimal_spread / 2
-        
-        # For KELP, we'll be slightly more conservative in our skewing
-        if imbalance > self.params[product]["order_skew_threshold"]:
-            bid_price = int(adjusted_fair_value - half_spread * 0.85)  # Tighter bid
-            ask_price = int(adjusted_fair_value + half_spread * 1.15)  # Wider ask
-        elif imbalance < -self.params[product]["order_skew_threshold"]:
-            bid_price = int(adjusted_fair_value - half_spread * 1.15)  # Wider bid
-            ask_price = int(adjusted_fair_value + half_spread * 0.85)  # Tighter ask
-        else:
-            bid_price = int(adjusted_fair_value - half_spread)
-            ask_price = int(adjusted_fair_value + half_spread)
-            
-        # Check position limits
-        max_buy_capacity = position_limit - position - take_buy_quantity
-        max_sell_capacity = position_limit + position - take_sell_quantity
-        
-        # Adjust order sizes based on remaining capacity
-        buy_size = min(buy_size, max_buy_capacity)
-        sell_size = min(sell_size, max_sell_capacity)
-        
-        # Place orders if there's capacity
-        if buy_size > 0:
-            orders.append(Order(product, bid_price, buy_size))
-            
-        if sell_size > 0:
-            orders.append(Order(product, ask_price, -sell_size))
-            
-        return orders, buy_size, sell_size
     
     """
     Main run function
@@ -1017,7 +927,7 @@ class Trader:
                 "price_history": {}
             }
         
-        """ Rainforest Resin"""
+        """ Rainforest Resin - Strategy selection based on signal strength"""
         
         if Product.RAINFOREST_RESIN in state.order_depths:
             resin_position = state.position.get(Product.RAINFOREST_RESIN, 0)
@@ -1027,7 +937,20 @@ class Trader:
             resin_best = self.best_orders(Product.RAINFOREST_RESIN, resin_order_depth)
             traderObject["prev_quote"][Product.RAINFOREST_RESIN] = resin_best
             
-            # taking orders
+            # Calculate volatility for signal strength evaluation
+            resin_mm_bid, resin_mm_ask, _, _ = self.mm_orders(Product.RAINFOREST_RESIN, resin_order_depth)
+            if resin_mm_bid is not None and resin_mm_ask is not None:
+                resin_mm_mid = (resin_mm_bid + resin_mm_ask) / 2
+                self.ewma_volatility(Product.RAINFOREST_RESIN, traderObject, resin_mm_mid, 0.94)
+            
+            # Calculate signal strength to determine which strategy to use
+            signal_strength = self.evaluate_signal_strength(
+                Product.RAINFOREST_RESIN, 
+                resin_order_depth, 
+                traderObject
+            )
+            
+            # Both v5 and v15 use the same strategy for Resin, so we'll use v5 for simplicity
             resin_take_orders, resin_take_buy_quantity, resin_take_sell_quantity = self.take_orders(
                 Product.RAINFOREST_RESIN,
                 resin_order_depth,
@@ -1036,11 +959,11 @@ class Trader:
                 self.LIMIT[Product.RAINFOREST_RESIN]
             )
             
-            # making orders
+            # Market making orders
             required_edge = 4
             default_order_size = 15
             
-            resin_make_orders, _, _ = self.resin_make_orders(
+            resin_make_orders, _, _ = self.resin_make_orders_v5(
                 Product.RAINFOREST_RESIN, 
                 resin_order_depth, 
                 self.params[Product.RAINFOREST_RESIN]["fair_value"], 
@@ -1052,8 +975,8 @@ class Trader:
                 resin_take_sell_quantity
             )
             
-            # clearing orders
-            resin_clear_orders, _, _ = self.clear_orders(
+            # Clearing orders
+            resin_clear_orders, _, _ = self.clear_orders_v5(
                 Product.RAINFOREST_RESIN,
                 resin_order_depth,
                 self.params[Product.RAINFOREST_RESIN]["fair_value"],
@@ -1064,10 +987,9 @@ class Trader:
                 resin_take_sell_quantity
             )
             
-            # adding orders together
             result[Product.RAINFOREST_RESIN] = (resin_take_orders + resin_make_orders + resin_clear_orders)
         
-        """ Kelp """
+        """ Kelp - Strategy selection based on signal strength """
         if Product.KELP in state.order_depths:
             kelp_position = state.position.get(Product.KELP, 0)
             kelp_order_depth = state.order_depths[Product.KELP]
@@ -1083,27 +1005,79 @@ class Trader:
                 
                 # Keep track of market prices for volatility calculation
                 self.rolling_mm_mid_quotes(Product.KELP, kelp_order_depth, traderObject, 100)
+                
+                # Calculate volatility for signal strength evaluation
+                self.ewma_volatility(Product.KELP, traderObject, kelp_mm_mid, 0.94)
             
+                # Calculate EWMA for fair value
                 kelp_fair_value = self.ewma(Product.KELP, traderObject, kelp_mm_mid, self.params[Product.KELP]["ewma_beta"])
                 if kelp_fair_value:
                     self.params[Product.KELP]["fair_value"] = kelp_fair_value
-                    
-                # Use our advanced market making strategy for KELP
-                kelp_mm_orders, kelp_buy_quantity, kelp_sell_quantity = self.kelp_market_making(
-                    Product.KELP,
-                    kelp_order_depth,
-                    kelp_fair_value or kelp_mm_mid,
-                    kelp_position,
-                    self.LIMIT[Product.KELP],
-                    traderObject,
-                    0,  # We're focusing on market making for KELP
-                    0
+                
+                # Calculate signal strength to determine which strategy to use
+                signal_strength = self.evaluate_signal_strength(
+                    Product.KELP, 
+                    kelp_order_depth, 
+                    traderObject
                 )
                 
-                result[Product.KELP] = kelp_mm_orders
+                # Log signal strength for monitoring
+                logger.print(f"KELP signal strength: {signal_strength:.4f}, threshold: {self.params[Product.KELP]['signal_threshold']:.4f}")
+                
+                # Take orders (common to both strategies)
+                kelp_take_orders, kelp_take_buy_quantity, kelp_take_sell_quantity = self.take_orders(
+                    Product.KELP,
+                    kelp_order_depth,
+                    kelp_fair_value,
+                    kelp_position,
+                    self.LIMIT[Product.KELP]
+                )
+                
+                # Choose strategy based on signal strength
+                if signal_strength >= self.params[Product.KELP]["signal_threshold"]:
+                    # Use advanced strategy (v15) for strong signals
+                    kelp_make_orders, kelp_buy, kelp_sell = self.kelp_market_making_v15(
+                        Product.KELP,
+                        kelp_order_depth,
+                        kelp_fair_value,
+                        kelp_position,
+                        self.LIMIT[Product.KELP],
+                        traderObject,
+                        kelp_take_buy_quantity,
+                        kelp_take_sell_quantity
+                    )
+                    logger.print(f"Used KELP v15 strategy (signal: {signal_strength:.4f})")
+                else:
+                    # Use simpler strategy (v5) for weak signals
+                    kelp_make_orders, kelp_buy, kelp_sell = self.kelp_make_orders_v5(
+                        Product.KELP,
+                        kelp_order_depth,
+                        kelp_fair_value,
+                        kelp_position,
+                        self.LIMIT[Product.KELP],
+                        15,  # default order size
+                        kelp_take_buy_quantity,
+                        kelp_take_sell_quantity,
+                        1,  # bias
+                        state
+                    )
+                    logger.print(f"Used KELP v5 strategy (signal: {signal_strength:.4f})")
+                
+                # Clear orders (common to both strategies)
+                kelp_clear_orders, _, _ = self.clear_orders_v5(
+                    Product.KELP,
+                    kelp_order_depth,
+                    kelp_fair_value,
+                    kelp_position,
+                    self.LIMIT[Product.KELP],
+                    self.params[Product.KELP]["clear_width"],
+                    kelp_take_buy_quantity,
+                    kelp_take_sell_quantity
+                )
+                
+                result[Product.KELP] = (kelp_take_orders + kelp_make_orders + kelp_clear_orders)
 
-        """ Squid Ink """
-        
+        """ Squid Ink - Strategy selection based on signal strength """
         if Product.SQUID_INK in state.order_depths:
             ink_position = state.position.get(Product.SQUID_INK, 0)
             ink_order_depth = state.order_depths[Product.SQUID_INK]
@@ -1116,33 +1090,83 @@ class Trader:
             
             if ink_mm_bid is not None and ink_mm_ask is not None:
                 ink_mm_mid = (ink_mm_bid + ink_mm_ask) / 2
-            
+                
                 # Keep track of market prices for volatility calculation
                 self.rolling_mm_mid_quotes(Product.SQUID_INK, ink_order_depth, traderObject, 100)
+                
+                # Calculate volatility for signal strength evaluation
+                self.ewma_volatility(Product.SQUID_INK, traderObject, ink_mm_mid, 0.94)
                         
+                # Calculate EWMA for fair value
                 ink_fair_value = self.ewma(Product.SQUID_INK, traderObject, ink_mm_mid, self.params[Product.SQUID_INK]["ewma_beta"])
                 if ink_fair_value:
                     self.params[Product.SQUID_INK]["fair_value"] = ink_fair_value
-                    
-                # Use our advanced market making strategy for SQUID_INK
-                ink_mm_orders, ink_buy_quantity, ink_sell_quantity = self.squid_ink_market_making(
-                    Product.SQUID_INK,
-                    ink_order_depth,
-                    ink_fair_value or ink_mm_mid,
-                    ink_position,
-                    self.LIMIT[Product.SQUID_INK],
-                    traderObject,
-                    0,  # We're not using take orders for SQUID_INK, focusing on market making only
-                    0
+                
+                # Calculate signal strength to determine which strategy to use
+                signal_strength = self.evaluate_signal_strength(
+                    Product.SQUID_INK, 
+                    ink_order_depth, 
+                    traderObject
                 )
                 
-                result[Product.SQUID_INK] = ink_mm_orders
-
+                # Log signal strength for monitoring
+                logger.print(f"SQUID_INK signal strength: {signal_strength:.4f}, threshold: {self.params[Product.SQUID_INK]['signal_threshold']:.4f}")
+                
+                # Take orders (common to both strategies)
+                ink_take_orders, ink_take_buy_quantity, ink_take_sell_quantity = self.take_orders(
+                    Product.SQUID_INK,
+                    ink_order_depth,
+                    ink_fair_value,
+                    ink_position,
+                    self.LIMIT[Product.SQUID_INK]
+                )
+                
+                # Choose strategy based on signal strength
+                if signal_strength >= self.params[Product.SQUID_INK]["signal_threshold"]:
+                    # Use advanced strategy (v15) for strong signals
+                    ink_make_orders, ink_buy, ink_sell = self.squid_ink_market_making_v15(
+                        Product.SQUID_INK,
+                        ink_order_depth,
+                        ink_fair_value,
+                        ink_position,
+                        self.LIMIT[Product.SQUID_INK],
+                        traderObject,
+                        ink_take_buy_quantity,
+                        ink_take_sell_quantity
+                    )
+                    logger.print(f"Used SQUID_INK v15 strategy (signal: {signal_strength:.4f})")
+                else:
+                    # Use simpler strategy (v5) for weak signals
+                    ink_make_orders, ink_buy, ink_sell = self.ink_make_orders_v5(
+                        Product.SQUID_INK,
+                        ink_order_depth,
+                        ink_fair_value,
+                        ink_position,
+                        self.LIMIT[Product.SQUID_INK],
+                        15,  # default order size
+                        ink_take_buy_quantity,
+                        ink_take_sell_quantity,
+                        1   # penny amount
+                    )
+                    logger.print(f"Used SQUID_INK v5 strategy (signal: {signal_strength:.4f})")
+                
+                # Clear orders (common to both strategies)
+                ink_clear_orders, _, _ = self.clear_orders_v5(
+                    Product.SQUID_INK,
+                    ink_order_depth,
+                    ink_fair_value,
+                    ink_position,
+                    self.LIMIT[Product.SQUID_INK],
+                    self.params[Product.SQUID_INK]["clear_width"],
+                    ink_take_buy_quantity,
+                    ink_take_sell_quantity
+                )
+                
+                result[Product.SQUID_INK] = (ink_take_orders + ink_make_orders + ink_clear_orders)
         
         """ 
         Tidying up
         """
-
         traderData = jsonpickle.encode(traderObject)
         logger.flush(state, result, conversions, traderData)
         

@@ -158,26 +158,26 @@ PARAMS = {
     Product.KELP: {
         "fair_value": 2000,
         "ewma_beta": 0, # found using grid search 0 - 1
-        "clear_width": 0,
-        "rolling_window": 100,  # Reduced window size for efficiency
+        "clear_width": 0.1,
+        "rolling_window": 25,  # Reduced window size for efficiency
         "spread_multiplier": 1.1,  # Multiplier for the typical spread (slightly smaller than SQUID_INK)
         "min_spread": 2,           # Minimum spread to use
         "max_spread": 5,           # Maximum spread to use (slightly smaller than SQUID_INK)
-        "position_scale": 0.55,     # How much to scale orders based on position
-        "vol_window": 15,          # Window for calculating spread
+        "position_scale": 0.6,     # How much to scale orders based on position
+        "vol_window": 10,          # Window for calculating spread
         "order_skew_threshold": 0.25 # Threshold for skewing orders based on book imbalance
     },
     Product.SQUID_INK: {
         "fair_value": 2000,
-        "ewma_beta": 0.25, # found using grid search 0 - 1
+        "ewma_beta": 0.15, # found using grid search 0 - 1
         "clear_width": 0,
-        "rolling_window": 100,  # Reduced window size for efficiency
+        "rolling_window": 50,  # Reduced window size for efficiency
         "spread_multiplier": 1.2,  # Multiplier for the typical spread
         "min_spread": 2,           # Minimum spread to use
         "max_spread": 6,           # Maximum spread to use
-        "position_scale": 0.7,     # How much to scale orders based on position
-        "vol_window": 20,          # Window for calculating spread
-        "order_skew_threshold": 0.3 # Threshold for skewing orders based on book imbalance
+        "position_scale": 0.85,     # How much to scale orders based on position
+        "vol_window": 30,          # Window for calculating spread
+        "order_skew_threshold": 0.4 # Threshold for skewing orders based on book imbalance
     }
 }
 

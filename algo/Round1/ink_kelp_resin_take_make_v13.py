@@ -162,7 +162,7 @@ class Product:
     SQUID_INK = "SQUID_INK"
     
     
-# Parameters - Adjusted based on analysis (e.g., tighter spreads, more stable EWMA, smaller orders)
+# Parameters - Adjusted for aggressive strategy combining v6 and v13 approaches
 PARAMS = {
     Product.RAINFOREST_RESIN: {
         "fair_value": 10000,
@@ -170,21 +170,33 @@ PARAMS = {
     },
     Product.KELP: {
         "fair_value": 2000,
-        "ewma_beta": 0.05, # More conservative (slower adaptation)
-        "min_spread": 1,   # Minimum spread of 1 tick
-        "max_spread": 2,   # Reduced max spread for lower volatility
-        "position_scale": 0.7, # More aggressive position scaling to reduce risk
-        "base_order_size": 15,  # Smaller order size
-        "history_maxlen": 50    # Reduced history length for simplicity
+        "ewma_beta": 0.05,  # Keep slight smoothing for stability
+        "min_spread": 2,    # Tighter spreads to capture more trades
+        "max_spread": 5,    # Allow wider spreads in volatile conditions
+        "position_scale": 0.3, # Less aggressive scaling to maintain larger positions
+        "base_order_size": 25, # Larger order size to capture more profit
+        "history_maxlen": 25,  # Keep more history for better analysis
+        "spread_multiplier": 1.1, # Lower multiplier for tighter spreads
+        "vol_window": 10,        # Window for calculating volatility-based spread
+        "order_skew_threshold": 0.8, # Lower threshold to react to smaller imbalances
+        "imbalance_multiplier": 0.5, # How much to adjust prices based on imbalance
+        "autocorr_weight": 0.3,   # How much to weight autocorrelation signals
+        "inventory_scale_factor": 0.3 # Scale orders based on inventory
     },
     Product.SQUID_INK: {
         "fair_value": 2000,
-        "ewma_beta": 0.05, # More conservative (slower adaptation)
-        "min_spread": 1,   # Minimum spread of 1 tick
-        "max_spread": 2,   # Reduced max spread for lower volatility  
-        "position_scale": 0.7, # More aggressive position scaling to reduce risk
-        "base_order_size": 15,  # Smaller order size
-        "history_maxlen": 50    # Reduced history length for simplicity
+        "ewma_beta": 0.15,  # Slightly more adaptive
+        "min_spread": 2,   # Tighter spreads to capture more trades
+        "max_spread": 5,   # Allow wider spreads in volatile conditions
+        "position_scale": 0.3, # Less aggressive scaling to maintain larger positions
+        "base_order_size": 25, # Larger order size to capture more profit
+        "history_maxlen": 50, # Keep more history for better analysis
+        "spread_multiplier": 1.2, # Lower multiplier for tighter spreads
+        "vol_window": 30,        # Window for calculating volatility-based spread
+        "order_skew_threshold": 0.8, # Lower threshold to react to smaller imbalances  
+        "imbalance_multiplier": 0.5, # How much to adjust prices based on imbalance
+        "autocorr_weight": 0.15,   # How much to weight autocorrelation signals
+        "inventory_scale_factor": 0.55 # Scale orders based on inventory
     }
 }
 
@@ -275,8 +287,95 @@ class Trader:
         return rolling_prices
     
     
-    # ... (order_flow_imbalance, previous_midprice, full_book_weighted_mid_price functions remain the same) ...
+    def order_flow_imbalance(
+        self,
+        product: str,
+        order_depth: OrderDepth,
+        traderObject: dict
+    ) -> float:
+        
+        """
+        Helper function used to find the order flow imbalance from current data
+        and previous data - useful for predicting short-term price movements
+        """
+        if "prev_quote" not in traderObject or product not in traderObject["prev_quote"] or not traderObject["prev_quote"][product]:
+            return 0.0
+            
+        B_n, A_n, q_B_n, q_A_n = self.best_orders(product, order_depth)
+        
+        if B_n is None or A_n is None:
+            return 0.0
+            
+        B_n_minus_1, A_n_minus_1, q_B_n_minus_1, q_A_n_minus_1 = traderObject["prev_quote"][product]
+        
+        if B_n_minus_1 is None or A_n_minus_1 is None or q_B_n_minus_1 is None or q_A_n_minus_1 is None:
+            return 0.0
+        
+        # Calculate indicators for price movements
+        I_B_increase = int(B_n > B_n_minus_1)  # 1 if best bid increases, else 0
+        I_B_decrease = int(B_n < B_n_minus_1)  # 1 if best bid decreases, else 0
+        I_A_increase = int(A_n > A_n_minus_1)  # 1 if best ask increases, else 0
+        I_A_decrease = int(A_n < A_n_minus_1)  # 1 if best ask decreases, else 0
+
+        # Calculate order flow imbalance - positive values indicate buying pressure
+        e_n = (I_B_increase * q_B_n 
+               - I_B_decrease * q_B_n_minus_1 
+               - I_A_decrease * q_A_n 
+               + I_A_increase * q_A_n_minus_1)
+
+        return float(e_n)  # Ensure we return a float
+
+    def previous_midprice(
+            self,
+            product: str,
+            traderObject: dict
+            ) -> float:
+        """
+        Helper function used to calculate the previous tick's mid price
+        """  
+        
+        if "prev_quote" not in traderObject or product not in traderObject["prev_quote"]:
+            return None
+            
+        try:
+            prev_bid = traderObject["prev_quote"][product][0]
+            prev_ask = traderObject["prev_quote"][product][1]
+            if prev_bid is not None and prev_ask is not None:
+                return (prev_bid + prev_ask) / 2
+            return None
+        
+        except (IndexError, TypeError):
+            return None
     
+    
+    def full_book_weighted_mid_price(
+            self,
+            product: str,
+            order_depth: OrderDepth
+            ) -> float:
+   
+        """
+        Computes the full book volume-weighted mid-price using *all* buy and sell orders.
+        More stable than simple mid price and accounts for volume imbalance.
+        """
+        if not order_depth.buy_orders and not order_depth.sell_orders:
+            return None
+            
+        # Convert to numpy arrays for faster computation
+        buy_prices = np.array(list(order_depth.buy_orders.keys()))
+        buy_volumes = np.array(list(order_depth.buy_orders.values()))
+        sell_prices = np.array(list(order_depth.sell_orders.keys()))
+        sell_volumes = np.abs(np.array(list(order_depth.sell_orders.values())))
+        
+        # Calculate weighted sum of prices
+        weighted_sum = np.sum(buy_prices * buy_volumes) + np.sum(sell_prices * sell_volumes)
+        total_volume = np.sum(buy_volumes) + np.sum(sell_volumes)
+    
+        if total_volume == 0:
+            return None
+    
+        return weighted_sum / total_volume
+
     def ewma(
         self,
         product: str,
@@ -550,12 +649,11 @@ class Trader:
 
     def analyze_price_autocorrelation(self, product: str, traderObject: dict, current_price: float) -> tuple[float, float, float]:
         """
-        Analyze price movements to detect negative autocorrelation and adjust market making strategy
-        Uses deque for price history.
+        Analyze price movements to detect mean reversion patterns and determine optimal price adjustments
         Returns:
-            - correlation_strength: measure of negative autocorrelation [-1 to 0]
-            - bid_adjustment: suggested adjustment to bid price based on recent movements
-            - ask_adjustment: suggested adjustment to ask price based on recent movements
+            - correlation_strength: measure of negative autocorrelation [-1 to 1]
+            - bid_adjustment: suggested adjustment to bid price based on mean reversion
+            - ask_adjustment: suggested adjustment to ask price based on mean reversion
         """
         if "price_history" not in traderObject:
             traderObject["price_history"] = {}
@@ -567,11 +665,8 @@ class Trader:
             
         price_history = traderObject["price_history"][product]
         
-        # Append current price
-        price_history.append(current_price)
-        
-        # Need at least 2 prices (1 return) for meaningful autocorrelation analysis
-        if len(price_history) < 2:
+        # Need at least 20 prices for meaningful autocorrelation analysis
+        if len(price_history) < 20:
             return 0.0, 0.0, 0.0
             
         # Convert to numpy array for efficient calculations
@@ -580,98 +675,90 @@ class Trader:
         # Calculate returns
         returns = np.diff(prices)
         
-        # Need at least 2 returns for lag-1 autocorrelation
-        if len(returns) < 2:
+        # Need at least 10 returns for lag-1 autocorrelation
+        if len(returns) < 10:
             return 0.0, 0.0, 0.0
             
         # Calculate lag-1 autocorrelation using numpy
         n = len(returns)
         mean_return = np.mean(returns)
         
-        # Handle case of zero variance to avoid division by zero
-        if np.var(returns) == 0:
-             autocorr = 0.0
-        else:
-             # Calculate autocorrelation
-             numerator = np.sum((returns[1:] - mean_return) * (returns[:-1] - mean_return))
-             denominator = np.sum((returns - mean_return) ** 2)
-             
-             if denominator == 0:
-                 autocorr = 0.0
-             else:
-                 autocorr = numerator / denominator
-        
-        # Limit to negative correlations only (for mean reversion strategy)
-        correlation_strength = min(autocorr, 0.0)
+        # Calculate autocorrelation
+        try:
+            numerator = np.sum((returns[1:] - mean_return) * (returns[:-1] - mean_return))
+            denominator = np.sum((returns - mean_return) ** 2)
+            
+            if denominator == 0:
+                autocorr = 0.0
+            else:
+                autocorr = numerator / denominator
+        except:
+            return 0.0, 0.0, 0.0
         
         # Recent price movement direction
         recent_movement = returns[-1] if returns.size > 0 else 0.0
         
-        # Calculate appropriate adjustments based on negative autocorrelation
-        # Apply a smaller adjustment factor based on the strength of negative correlation
-        adjustment_factor = abs(correlation_strength) * 0.5  # Adjust this factor
-        
+        # Calculate appropriate adjustments based on autocorrelation
+        # For mean reversion strategies, we focus on negative autocorrelation
         bid_adjustment = 0.0
         ask_adjustment = 0.0
         
-        # If prices just went up (positive recent movement), negative autocorrelation suggests they'll likely go down next.
-        # We should adjust our ask price slightly lower to capture potential sellers before the drop.
-        if recent_movement > 0:
-            ask_adjustment = -recent_movement * adjustment_factor
-        # If prices just went down (negative recent movement), negative autocorrelation suggests they'll likely go up next.
-        # We should adjust our bid price slightly higher to capture potential buyers before the rise.
-        elif recent_movement < 0:
-            bid_adjustment = -recent_movement * adjustment_factor  # Negate recent_movement as it's negative
+        # If prices just went up and we have negative autocorrelation,
+        # they'll likely go down next
+        if recent_movement > 0 and autocorr < 0:
+            bid_adjustment = -recent_movement * abs(autocorr)  # Lower bid
+            ask_adjustment = -recent_movement * abs(autocorr)  # Lower ask
+        # If prices just went down and we have negative autocorrelation,
+        # they'll likely go up next  
+        elif recent_movement < 0 and autocorr < 0:
+            bid_adjustment = -recent_movement * abs(autocorr)  # Higher bid
+            ask_adjustment = -recent_movement * abs(autocorr)  # Higher ask
+        
+        # Focus only on negative autocorrelation (mean reversion)
+        correlation_strength = min(autocorr, 0.0)
             
         return correlation_strength, bid_adjustment, ask_adjustment
 
-    def calculate_tick_size(self, product_history):
+    def calculate_tick_size(self, price_history):
         """
-        Estimate the effective tick size from recent price changes.
+        Estimate the minimum price increment (tick size) from price history
         """
-        if not product_history or len(product_history) < 2:
-            return 1.0  # Default to 1 if not enough data
-
-        prices = np.array(list(product_history))
-        diffs = np.diff(prices)
-
-        # Consider non-zero price changes
-        non_zero_diffs = np.abs(diffs[diffs != 0])
+        if not price_history or len(price_history) < 10:
+            return 1  # Default to 1 if not enough data
         
+        # Get unique prices
+        prices = np.array(list(price_history))
+        unique_prices = np.unique(prices)
+        
+        if len(unique_prices) <= 1:
+            return 1  # Default if all prices are the same
+        
+        # Calculate differences between consecutive prices
+        sorted_prices = np.sort(unique_prices)
+        diffs = np.diff(sorted_prices)
+        
+        # Find the minimum non-zero difference
+        non_zero_diffs = diffs[diffs > 0]
         if len(non_zero_diffs) == 0:
-            return 1.0 # Default if all changes are zero
-
-        # Find the GCD of the absolute non-zero differences
-        # This is a heuristic for tick size
-        # Use np.gcd.reduce for multiple numbers
-        try:
-            # Multiply by a factor to handle potential floating point inaccuracies
-            # And find GCD of integers.
-            factor = 100 # Assume prices are multiples of 0.01
-            scaled_diffs = np.round(non_zero_diffs * factor).astype(int)
+            return 1
+        
+        min_tick = np.min(non_zero_diffs)
+        
+        # Round to the nearest common tick size (0.01, 0.1, 1, 2, 5, etc.)
+        if min_tick < 0.01:
+            return 0.01
+        elif min_tick < 0.1:
+            return 0.1
+        elif min_tick < 1:
+            return 1
+        else:
+            # For larger ticks, try to find clean values (1, 2, 5, 10, etc.)
+            for standard_tick in [1, 2, 5, 10, 20, 50, 100]:
+                if abs(min_tick - standard_tick) / standard_tick < 0.1:  # Within 10%
+                    return standard_tick
             
-            if scaled_diffs.size == 0:
-                 return 1.0
-
-            # Remove zeros and handle potential negative values if any
-            unique_scaled_diffs = np.unique(scaled_diffs[scaled_diffs != 0])
-
-            if unique_scaled_diffs.size == 0:
-                return 1.0
-
-            # Compute GCD of the absolute values
-            tick_gcd_scaled = np.gcd.reduce(np.abs(unique_scaled_diffs))
-
-            # Convert back to original scale
-            if tick_gcd_scaled > 0:
-                 return tick_gcd_scaled / factor
-            else:
-                 return 1.0 / factor # Handle case where GCD is 0 (e.g., all diffs were 0)
-                 
-        except Exception as e:
-             logger.print(f"Error calculating tick size: {e}")
-             return 1.0
-
+            # Otherwise return the actual minimum tick size
+            return min_tick
 
     def get_optimal_mid_price(self, order_depth: OrderDepth, current_mid: float, position: int, position_limit: int, product: str, traderObject: dict) -> float:
         """
@@ -746,54 +833,132 @@ class Trader:
         take_sell_quantity: int
         ) -> (List[Order], int, int):
         """
-        Simplified market making strategy for SQUID_INK with focus on conservative approach
-        and reduced complexity while maintaining essence of the strategy.
+        Aggressive market making strategy for SQUID_INK optimized for maximum returns
         """
-        
         orders = []
         
         # Get current mid price from best orders
-        best_bid, best_ask, _, _ = self.best_orders(product, order_depth)
+        best_bid, best_ask, best_bid_amt, best_ask_amt = self.best_orders(product, order_depth)
         if best_bid is None or best_ask is None:
              return [], 0, 0
         
         current_mid = (best_bid + best_ask) / 2
         
-        # Update EWMA for fair value determination (simple and stable)
-        fair_value = self.ewma(product, traderObject, current_mid, self.params[product]["ewma_beta"])
-        if fair_value is None:
-            fair_value = current_mid
+        # Store price in history for volatility and autocorrelation calculations
+        if product not in traderObject.get("price_history", {}):
+            if "price_history" not in traderObject:
+                traderObject["price_history"] = {}
+            traderObject["price_history"][product] = deque(maxlen=self.params[product]["history_maxlen"])
         
-        # Use a simple spread calculation based on min/max params
-        spread = self.params[product]["min_spread"]
+        traderObject["price_history"][product].append(current_mid)
         
-        # Simple inventory skewing - shift price slightly based on position
+        # Update volatility estimate for dynamic spread calculation
+        volatility = self.ewma_volatility(product, traderObject, current_mid, 0.94)
+        
+        # Calculate book imbalance (demand vs supply)
+        imbalance = self.calculate_book_imbalance(order_depth)
+        
+        # Look for price autocorrelation (mean reversion)
+        corr_strength, bid_adj, ask_adj = self.analyze_price_autocorrelation(
+            product, traderObject, current_mid
+        )
+        
+        # Calculate optimal fair value based on all signals
+        # Start with EWMA price as baseline
+        optimal_fair_value = self.ewma(product, traderObject, current_mid, self.params[product]["ewma_beta"])
+        if optimal_fair_value is None:
+            optimal_fair_value = current_mid
+        
+        # Adjust fair value based on order book imbalance - more aggressively than Kelp
+        imbalance_adjustment = imbalance * (best_ask - best_bid) * self.params[product]["imbalance_multiplier"] * 1.2
+        optimal_fair_value += imbalance_adjustment
+        
+        # Get estimated tick size for this product
+        tick_size = self.calculate_tick_size(traderObject["price_history"][product])
+        
+        # Calculate optimal spread based on volatility - even more aggressive with tighter spreads
+        # than Kelp for higher turnover
+        optimal_spread = max(
+            self.params[product]["min_spread"] * tick_size,
+            min(
+                self.params[product]["max_spread"] * tick_size,
+                volatility * self.params[product]["spread_multiplier"] * 0.8  # 20% tighter than formula for Kelp
+            )
+        )
+        
+        # Calculate base prices
+        bid_price = int(optimal_fair_value - optimal_spread/2)
+        ask_price = int(optimal_fair_value + optimal_spread/2)
+        
+        # Apply autocorrelation-based adjustments for aggressive mean reversion strategies
+        # More responsive to autocorrelation than Kelp
+        if corr_strength < -0.15:  # Lower threshold than Kelp (-0.2)
+            bid_price += int(bid_adj * self.params[product]["autocorr_weight"] * 1.2)
+            ask_price += int(ask_adj * self.params[product]["autocorr_weight"] * 1.2)
+        
+        # Apply aggressive position-based adjustments - smaller adjustment when near zero
+        # larger adjustment when nearing limits to ensure mean reversion to zero
         position_ratio = position / position_limit
-        skew_factor = position_ratio * 0.5  # Conservative skew factor
+        inventory_skew = position_ratio * optimal_spread * self.params[product]["inventory_scale_factor"]
         
-        # Calculate prices with inventory skew
-        bid_price = int(fair_value - spread/2 - skew_factor)
-        ask_price = int(fair_value + spread/2 - skew_factor)
+        # Shift both bid and ask in the direction that reduces inventory
+        bid_price -= int(inventory_skew)
+        ask_price -= int(inventory_skew)
         
+        # Dynamic order sizing - aggressively scale up size when expecting favorable price moves
+        # Base size is larger than conservative approach
+        base_size = self.params[product]["base_order_size"]  # Already set to 25 in parameters
+        
+        # Scale order sizes based on signals:
+        # 1. Larger orders when we're confident about directional movement
+        # 2. Smaller orders when near position limits
+        
+        # Position scaling factor - reduce size as position grows in either direction
+        # Less reduction than Kelp to maintain larger positions
+        position_scale = 1.0 - abs(position_ratio) * self.params[product]["position_scale"] * 0.8
+        
+        # Signal-based sizing: larger sizes when signals strongly favor a direction
+        # More aggressive than Kelp
+        signal_adjustment = 1.0
+        
+        # If imbalance and autocorrelation agree on direction, increase size more than Kelp
+        if (imbalance > 0.25 and bid_adj > 0) or (imbalance < -0.25 and ask_adj < 0):
+            signal_adjustment = 1.5  # 50% size increase when signals align (vs 30% for Kelp)
+        
+        # Calculate final sizes with aggressive scaling
+        buy_size = int(base_size * position_scale * signal_adjustment)
+        sell_size = int(base_size * position_scale * signal_adjustment)
+        
+        # Further skew sizes based on position - aggressively reduce oversized positions
+        # but less aggressively than Kelp to maintain larger positions when profitable
+        if position > 0:
+            buy_size = int(buy_size * (1 - position_ratio * 0.7))  # Less reduction than Kelp (0.8)
+            sell_size = int(sell_size * (1 + position_ratio * 0.6))  # More increase than Kelp (0.5)
+        elif position < 0:
+            buy_size = int(buy_size * (1 + abs(position_ratio) * 0.6))  # More increase than Kelp (0.5)
+            sell_size = int(sell_size * (1 - abs(position_ratio) * 0.7))  # Less reduction than Kelp (0.8)
+            
         # Calculate available capacity
         max_buy_capacity = position_limit - position - take_buy_quantity
         max_sell_capacity = position_limit + position - take_sell_quantity
-        
-        # Calculate order sizes - scale down as position grows
-        base_size = self.params[product]["base_order_size"]
-        buy_size = int(base_size * (1 - max(0, position / position_limit) * self.params[product]["position_scale"]))
-        sell_size = int(base_size * (1 - max(0, -position / position_limit) * self.params[product]["position_scale"]))
         
         # Ensure minimum sizes and respect capacity
         buy_size = max(1, min(buy_size, max_buy_capacity))
         sell_size = max(1, min(sell_size, max_sell_capacity))
         
-        # Place orders only if improving the book
-        if buy_size > 0 and bid_price > best_bid:
-             orders.append(Order(product, bid_price, buy_size))
-             
-        if sell_size > 0 and ask_price < best_ask:
-             orders.append(Order(product, ask_price, -sell_size))
+        # Always improve the best bid/ask - aggressive penny jumping by 2 ticks when possible
+        if best_bid is not None and bid_price <= best_bid:
+            bid_price = best_bid + min(2, int(tick_size))  # Jump by 2 ticks when possible
+            
+        if best_ask is not None and ask_price >= best_ask:
+            ask_price = best_ask - min(2, int(tick_size))  # Jump by 2 ticks when possible
+        
+        # Place orders if we have capacity and they're sensible
+        if buy_size > 0 and bid_price < ask_price:
+            orders.append(Order(product, bid_price, buy_size))
+            
+        if sell_size > 0 and ask_price > bid_price:
+            orders.append(Order(product, ask_price, -sell_size))
         
         return orders, buy_size, sell_size
 
@@ -808,57 +973,204 @@ class Trader:
         take_sell_quantity: int
         ) -> (List[Order], int, int):
         """
-        Simplified market making strategy for KELP with focus on conservative approach
-        and reduced complexity while maintaining essence of the strategy.
+        Aggressive market making strategy for KELP optimized for maximum returns
         """
-        
         orders = []
         
         # Get current mid price from best orders
-        best_bid, best_ask, _, _ = self.best_orders(product, order_depth)
+        best_bid, best_ask, best_bid_amt, best_ask_amt = self.best_orders(product, order_depth)
         if best_bid is None or best_ask is None:
              return [], 0, 0
         
         current_mid = (best_bid + best_ask) / 2
         
-        # Update EWMA for fair value determination (simple and stable)
-        fair_value = self.ewma(product, traderObject, current_mid, self.params[product]["ewma_beta"])
-        if fair_value is None:
-            fair_value = current_mid
+        # Store price in history for volatility and autocorrelation calculations
+        if product not in traderObject.get("price_history", {}):
+            if "price_history" not in traderObject:
+                traderObject["price_history"] = {}
+            traderObject["price_history"][product] = deque(maxlen=self.params[product]["history_maxlen"])
         
-        # Use a simple spread calculation based on min/max params
-        spread = self.params[product]["min_spread"]
+        traderObject["price_history"][product].append(current_mid)
         
-        # Simple inventory skewing - shift price slightly based on position
+        # Update volatility estimate for dynamic spread calculation
+        volatility = self.ewma_volatility(product, traderObject, current_mid, 0.94)
+        
+        # Calculate book imbalance (demand vs supply)
+        imbalance = self.calculate_book_imbalance(order_depth)
+        
+        # Look for price autocorrelation (mean reversion)
+        corr_strength, bid_adj, ask_adj = self.analyze_price_autocorrelation(
+            product, traderObject, current_mid
+        )
+        
+        # Calculate optimal fair value based on all signals
+        # Start with EWMA price as baseline
+        optimal_fair_value = self.ewma(product, traderObject, current_mid, self.params[product]["ewma_beta"])
+        if optimal_fair_value is None:
+            optimal_fair_value = current_mid
+        
+        # Adjust fair value based on order book imbalance
+        imbalance_adjustment = imbalance * (best_ask - best_bid) * self.params[product]["imbalance_multiplier"]
+        optimal_fair_value += imbalance_adjustment
+        
+        # Get estimated tick size for this product
+        tick_size = self.calculate_tick_size(traderObject["price_history"][product])
+        
+        # Calculate optimal spread based on volatility - more aggressive with tighter spreads
+        # but allowing wider spreads when volatility increases
+        optimal_spread = max(
+            self.params[product]["min_spread"] * tick_size,
+            min(
+                self.params[product]["max_spread"] * tick_size,
+                volatility * self.params[product]["spread_multiplier"]
+            )
+        )
+        
+        # Calculate base prices
+        bid_price = int(optimal_fair_value - optimal_spread/2)
+        ask_price = int(optimal_fair_value + optimal_spread/2)
+        
+        # Apply autocorrelation-based adjustments for aggressive mean reversion strategies
+        if corr_strength < -0.2:  # Only if significant negative autocorrelation
+            bid_price += int(bid_adj * self.params[product]["autocorr_weight"])
+            ask_price += int(ask_adj * self.params[product]["autocorr_weight"])
+        
+        # Apply aggressive position-based adjustments - smaller adjustment when near zero
+        # larger adjustment when nearing limits to ensure mean reversion to zero
         position_ratio = position / position_limit
-        skew_factor = position_ratio * 0.5  # Conservative skew factor
+        inventory_skew = position_ratio * optimal_spread * self.params[product]["inventory_scale_factor"]
         
-        # Calculate prices with inventory skew
-        bid_price = int(fair_value - spread/2 - skew_factor)
-        ask_price = int(fair_value + spread/2 - skew_factor)
+        # Shift both bid and ask in the direction that reduces inventory
+        bid_price -= int(inventory_skew)
+        ask_price -= int(inventory_skew)
         
+        # Dynamic order sizing - aggressively scale up size when expecting favorable price moves
+        # Base size is larger than conservative approach
+        base_size = self.params[product]["base_order_size"]  # Already set to 25 in parameters
+        
+        # Scale order sizes based on signals:
+        # 1. Larger orders when we're confident about directional movement
+        # 2. Smaller orders when near position limits
+        
+        # Position scaling factor - reduce size as position grows in either direction
+        position_scale = 1.0 - abs(position_ratio) * self.params[product]["position_scale"]
+        
+        # Signal-based sizing: larger sizes when signals strongly favor a direction
+        signal_adjustment = 1.0
+        
+        # If imbalance and autocorrelation agree on direction, increase size
+        if (imbalance > 0.3 and bid_adj > 0) or (imbalance < -0.3 and ask_adj < 0):
+            signal_adjustment = 1.3  # 30% size increase when signals align
+        
+        # Calculate final sizes with aggressive scaling
+        buy_size = int(base_size * position_scale * signal_adjustment)
+        sell_size = int(base_size * position_scale * signal_adjustment)
+        
+        # Further skew sizes based on position - aggressively reduce oversized positions
+        if position > 0:
+            buy_size = int(buy_size * (1 - position_ratio * 0.8))
+            sell_size = int(sell_size * (1 + position_ratio * 0.5)) # Slightly increase sell size
+        elif position < 0:
+            buy_size = int(buy_size * (1 + abs(position_ratio) * 0.5))
+            sell_size = int(sell_size * (1 - abs(position_ratio) * 0.8))
+            
         # Calculate available capacity
         max_buy_capacity = position_limit - position - take_buy_quantity
         max_sell_capacity = position_limit + position - take_sell_quantity
-        
-        # Calculate order sizes - scale down as position grows
-        base_size = self.params[product]["base_order_size"]
-        buy_size = int(base_size * (1 - max(0, position / position_limit) * self.params[product]["position_scale"]))
-        sell_size = int(base_size * (1 - max(0, -position / position_limit) * self.params[product]["position_scale"]))
         
         # Ensure minimum sizes and respect capacity
         buy_size = max(1, min(buy_size, max_buy_capacity))
         sell_size = max(1, min(sell_size, max_sell_capacity))
         
-        # Place orders only if improving the book
-        if buy_size > 0 and bid_price > best_bid:
-             orders.append(Order(product, bid_price, buy_size))
-             
-        if sell_size > 0 and ask_price < best_ask:
-             orders.append(Order(product, ask_price, -sell_size))
+        # Always improve the best bid/ask - aggressive penny jumping
+        if best_bid is not None and bid_price <= best_bid:
+            bid_price = best_bid + 1
+            
+        if best_ask is not None and ask_price >= best_ask:
+            ask_price = best_ask - 1
+        
+        # Place orders if we have capacity and they're sensible
+        if buy_size > 0 and bid_price < ask_price:
+            orders.append(Order(product, bid_price, buy_size))
+            
+        if sell_size > 0 and ask_price > bid_price:
+            orders.append(Order(product, ask_price, -sell_size))
         
         return orders, buy_size, sell_size
-    
+
+    def ink_fair_value(
+        self,
+        product: str,
+        traderObject: dict,
+        kelp_lag: int = 5  # Default lag for observing correlation between products
+        ) -> float:
+        """
+        Compute potential fair value for Squid Ink based on Kelp price movement
+        This leverages potential cross-product correlations
+        """
+        kelp_prices = traderObject.get("rolling_mid_quotes", {}).get(Product.KELP)
+        ink_prices = traderObject.get("rolling_mid_quotes", {}).get(Product.SQUID_INK)
+        
+        if not kelp_prices or not ink_prices or len(kelp_prices) <= kelp_lag or len(ink_prices) < 2:
+            return None
+        
+        # Convert to numpy arrays for efficient calculation
+        kelp_array = np.array(list(kelp_prices))
+        ink_array = np.array(list(ink_prices))
+        
+        # Calculate if there's strong positive correlation between lagged kelp and current ink
+        if len(kelp_array) > kelp_lag + 10 and len(ink_array) > 10:
+            # Use lagged kelp prices
+            lagged_kelp = kelp_array[:-kelp_lag]
+            # Use matching ink prices
+            matching_ink = ink_array[kelp_lag:]
+            
+            # Only proceed if we have enough data points
+            if len(lagged_kelp) > 10:
+                # Calculate correlation coefficient
+                try:
+                    correlation = np.corrcoef(lagged_kelp, matching_ink)[0, 1]
+                    
+                    # If strong positive correlation, use lagged kelp to predict ink
+                    if correlation > 0.7:  # Threshold for strong correlation
+                        # Predict ink based on recent kelp movement
+                        recent_kelp_change = (kelp_array[-1] - kelp_array[-kelp_lag-1]) / kelp_array[-kelp_lag-1]
+                        predicted_ink = ink_array[-1] * (1 + recent_kelp_change * 0.8)  # Dampen effect
+                        return predicted_ink
+                except:
+                    pass  # If correlation calculation fails, fall back to default
+        
+        # Default: Use recent ink prices directly
+        recent_ink = ink_array[-min(10, len(ink_array)):]
+        return np.mean(recent_ink)  # Simple average of recent prices
+
+    def analyze_trend_strength(self, product: str, traderObject: dict) -> float:
+        """
+        Analyze price trends to determine strength and direction
+        Returns a value between -1 (strong downtrend) and 1 (strong uptrend)
+        """
+        if "price_history" not in traderObject or product not in traderObject["price_history"]:
+            return 0.0
+            
+        price_history = traderObject["price_history"][product]
+        
+        if len(price_history) < 10:  # Need at least 10 data points
+            return 0.0
+            
+        # Use numpy for efficient calculations
+        prices = np.array(list(price_history))
+        
+        # Simple trend calculation: compare recent average to overall average
+        short_term_avg = np.mean(prices[-5:])  # Last 5 prices
+        medium_term_avg = np.mean(prices[-20:] if len(prices) >= 20 else prices)  # Last 20 or all
+        
+        # Calculate trend direction and normalize to [-1, 1]
+        max_diff = np.std(prices) * 2  # Use 2 standard deviations as max diff
+        if max_diff == 0:  # Avoid division by zero
+            return 0.0
+            
+        trend = (short_term_avg - medium_term_avg) / max_diff
+        return max(min(trend, 1.0), -1.0)  # Clamp between -1 and 1
     
     def run(self, state: TradingState) -> tuple[dict[Symbol, list[Order]], int, str]:
         result = {}

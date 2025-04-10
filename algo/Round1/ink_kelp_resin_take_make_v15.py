@@ -153,31 +153,34 @@ class Product:
 PARAMS = {
     Product.RAINFOREST_RESIN: {
         "fair_value": 10000,
-        "clear_width": 0
+        "clear_width": 0,
+        "signal_threshold": 0.05  # Threshold to switch between strategies
     },
     Product.KELP: {
         "fair_value": 2000,
         "ewma_beta": 0, # found using grid search 0 - 1
-        "clear_width": 0,
-        "rolling_window": 100,  # Reduced window size for efficiency
-        "spread_multiplier": 1.1,  # Multiplier for the typical spread (slightly smaller than SQUID_INK)
+        "clear_width": 0.1,
+        "rolling_window": 35,  # Reduced window size for efficiency
+        "spread_multiplier": 1.2,  # Multiplier for the typical spread (slightly smaller than SQUID_INK)
         "min_spread": 2,           # Minimum spread to use
         "max_spread": 5,           # Maximum spread to use (slightly smaller than SQUID_INK)
-        "position_scale": 0.55,     # How much to scale orders based on position
-        "vol_window": 15,          # Window for calculating spread
-        "order_skew_threshold": 0.25 # Threshold for skewing orders based on book imbalance
+        "position_scale": 0.6,     # How much to scale orders based on position
+        "vol_window": 10,          # Window for calculating spread
+        "order_skew_threshold": 0.25, # Threshold for skewing orders based on book imbalance
+        "signal_threshold": 0.35     # Threshold to switch between strategies - higher for KELP
     },
     Product.SQUID_INK: {
         "fair_value": 2000,
-        "ewma_beta": 0.25, # found using grid search 0 - 1
+        "ewma_beta": 0.2, # found using grid search 0 - 1
         "clear_width": 0,
-        "rolling_window": 100,  # Reduced window size for efficiency
-        "spread_multiplier": 1.2,  # Multiplier for the typical spread
+        "rolling_window": 50,  # Reduced window size for efficiency
+        "spread_multiplier": 1.5,  # Multiplier for the typical spread
         "min_spread": 2,           # Minimum spread to use
         "max_spread": 6,           # Maximum spread to use
-        "position_scale": 0.7,     # How much to scale orders based on position
-        "vol_window": 20,          # Window for calculating spread
-        "order_skew_threshold": 0.3 # Threshold for skewing orders based on book imbalance
+        "position_scale": 0.75,     # How much to scale orders based on position
+        "vol_window": 30,          # Window for calculating spread
+        "order_skew_threshold": 0.4, # Threshold for skewing orders based on book imbalance
+        "signal_threshold": 0.6    # Threshold to switch between strategies - highest for SQUID_INK
     }
 }
 
@@ -989,6 +992,45 @@ class Trader:
             orders.append(Order(product, ask_price, -sell_size))
             
         return orders, buy_size, sell_size
+    
+    def evaluate_signal_strength(
+            self,
+            product: str,
+            order_depth: OrderDepth,
+            traderObject: dict
+            ) -> float:
+        """
+        Evaluates the strength of market signals to determine which strategy to use.
+        Returns a normalized value between 0 and 1 where higher values indicate stronger signals.
+        """
+        # Calculate book imbalance as one signal component
+        imbalance = self.calculate_book_imbalance(order_depth)
+        imbalance_strength = abs(imbalance)
+        
+        # Calculate order flow imbalance as another signal component
+        flow_imbalance = self.order_flow_imbalance(product, order_depth, traderObject)
+        
+        # Normalize flow_imbalance (typically in range of volume)
+        max_flow = 50  # typical max position
+        flow_strength = min(1.0, abs(flow_imbalance) / max_flow)
+        
+        # Calculate price volatility as another signal component
+        volatility = 0
+        if "vol" in traderObject and product in traderObject["vol"]:
+            vol_data = traderObject["vol"][product]
+            if "ewma_var" in vol_data:
+                volatility = vol_data["ewma_var"] ** 0.5  # Get standard deviation
+                
+        # Normalize volatility (typically in range of 1-10 price units)
+        vol_strength = min(1.0, volatility / 10.0)
+        
+        # Combine signals with weights
+        # Imbalance gets highest weight as it's most reliable for short-term direction
+        # Volatility gets medium weight as it indicates potential trading opportunities
+        # Flow gets lowest weight as it can be noisy
+        signal_strength = (0.5 * imbalance_strength) + (0.3 * vol_strength) + (0.2 * flow_strength)
+        
+        return signal_strength
     
     """
     Main run function
